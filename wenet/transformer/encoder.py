@@ -36,6 +36,8 @@ from wenet.transformer.subsampling import LinearNoSubsampling
 from wenet.utils.common import get_activation
 from wenet.utils.mask import make_pad_mask
 from wenet.utils.mask import add_optional_chunk_mask
+# from wenet.transformer.ema import EMAModuleConfig, EMAModule
+# from wenet.transformer.ema import Data2VecAudioConfig
 
 
 class BaseEncoder(torch.nn.Module):
@@ -460,3 +462,183 @@ class ConformerEncoder(BaseEncoder):
                 concat_after,
             ) for _ in range(num_blocks)
         ])
+
+'''
+def get_annealed_rate(start, end, curr_step, total_steps):
+    r = end - start
+    pct_remaining = 1 - curr_step / total_steps
+    return end - r * pct_remaining
+
+class Data2vecConformerEncoder(torch.nn.Module):
+    """Conformer encoder module."""
+    def __init__(
+        self,
+        input_size: int,
+        output_size: int = 256,
+        attention_heads: int = 4,
+        linear_units: int = 2048,
+        num_blocks: int = 6,
+        dropout_rate: float = 0.1,
+        positional_dropout_rate: float = 0.1,
+        attention_dropout_rate: float = 0.0,
+        normalize_before: bool = True,
+        concat_after: bool = False,
+        static_chunk_size: int = 0,
+        use_dynamic_chunk: bool = False,
+        global_cmvn: torch.nn.Module = None,
+        use_dynamic_left_chunk: bool = False,
+        activation_type: str = "swish",
+        cnn_module_kernel: int = 15,
+        causal: bool = False,
+        cnn_module_norm: str = "batch_norm",
+    ):
+        """Construct ConformerEncoder
+
+        Args:
+            input_size to use_dynamic_chunk, see in BaseEncoder
+            positionwise_conv_kernel_size (int): Kernel size of positionwise
+                conv1d layer.
+            macaron_style (bool): Whether to use macaron style for
+                positionwise layer.
+            selfattention_layer_type (str): Encoder attention layer type,
+                the parameter has no effect now, it's just for configure
+                compatibility.
+            activation_type (str): Encoder activation function type.
+            use_cnn_module (bool): Whether to use convolution module.
+            cnn_module_kernel (int): Kernel size of convolution module.
+            causal (bool): whether to use causal convolution or not.
+        """
+        assert check_argument_types()
+        super().__init__()
+        activation = get_activation(activation_type)
+
+        self.global_cmvn = global_cmvn
+        self.embed = Conv2dSubsampling4(
+            input_size,
+            output_size,
+            dropout_rate,
+            PositionalEncoding(output_size, positional_dropout_rate),
+        )
+
+        self.normalize_before = normalize_before
+        self.after_norm = torch.nn.LayerNorm(output_size, eps=1e-5)
+        self.static_chunk_size = static_chunk_size
+        self.use_dynamic_chunk = use_dynamic_chunk
+        self.use_dynamic_left_chunk = use_dynamic_left_chunk
+
+        encoder_selfattn_layer = MultiHeadedAttention(
+            attention_heads,
+            output_size,
+            attention_dropout_rate,
+        )
+        # feed-forward module definition
+        positionwise_layer = PositionwiseFeedForward(
+            output_size,
+            linear_units,
+            dropout_rate,
+            activation,
+        )
+        # convolution module definition
+        convolution_layer = ConvolutionModule(
+            output_size, 
+            cnn_module_kernel, 
+            activation,
+            cnn_module_norm, 
+            causal
+        )
+
+        self.encoders = torch.nn.ModuleList([
+            ConformerEncoderLayer(
+                output_size,
+                encoder_selfattn_layer,
+                positionwise_layer,
+                positionwise_layer,
+                convolution_layer,
+                dropout_rate,
+                normalize_before,
+                concat_after,
+            ) for _ in range(num_blocks)
+        ])
+        self.ema = None
+        self.cfg = Data2VecAudioConfig
+        self.final_proj = torch.nn.Linear(output_size, output_size)
+
+    def forward(
+        self,
+        xs: torch.Tensor,
+        xs_lens: torch.Tensor,
+        decoding_chunk_size: int = 0,
+        num_decoding_left_chunks: int = -1,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Embed positions in tensor.
+
+        Args:
+            xs: padded input tensor (B, T, D)
+            xs_lens: input length (B)
+            decoding_chunk_size: decoding chunk size for dynamic chunk
+                0: default for training, use random dynamic chunk.
+                <0: for decoding, use full chunk.
+                >0: for decoding, use fixed chunk size as set.
+            num_decoding_left_chunks: number of left chunks, this is for decoding,
+            the chunk size is decoding_chunk_size.
+                >=0: use num_decoding_left_chunks
+                <0: use all left chunks
+        Returns:
+            encoder output tensor xs, and subsampled masks
+            xs: padded output tensor (B, T' ~= T/subsample_rate, D)
+            masks: torch.Tensor batch padding mask after subsample
+                (B, 1, T' ~= T/subsample_rate)
+        """
+        T = xs.size(1)
+        masks = ~make_pad_mask(xs_lens, T).unsqueeze(1)  # (B, 1, T)
+        if self.global_cmvn is not None:
+            xs = self.global_cmvn(xs)
+        xs, pos_emb, masks = self.embed(xs, masks)
+        mask_pad = masks  # (B, 1, T/subsample_rate)
+        chunk_masks = add_optional_chunk_mask(xs, masks,
+                                              self.use_dynamic_chunk,
+                                              self.use_dynamic_left_chunk,
+                                              decoding_chunk_size,
+                                              self.static_chunk_size,
+                                              num_decoding_left_chunks)
+        for layer in self.encoders:
+            xs, chunk_masks, _, _ = layer(xs, chunk_masks, pos_emb, mask_pad)
+        if self.normalize_before:
+            xs = self.after_norm(xs)
+        # Here we assume the mask is not changed in encoder layers, so just
+        # return the masks before encoder layers, and the masks will be used
+        # for cross attention with decoder later
+        return xs, masks
+
+    
+    def set_num_updates(self, num_updates):
+        if self.ema is None and self.final_proj is not None:
+            self.make_ema_teacher()
+        elif self.training and self.ema is not None:
+            if self.cfg.ema_decay != self.cfg.ema_end_decay:
+                if num_updates >= self.cfg.ema_anneal_end_step:
+                    decay = self.cfg.ema_end_decay
+                else:
+                    decay = get_annealed_rate(
+                        self.cfg.ema_decay,
+                        self.cfg.ema_end_decay,
+                        num_updates,
+                        self.cfg.ema_anneal_end_step,
+                    )
+                self.ema.set_decay(decay)
+            if self.ema.get_decay() < 1:
+                self.ema.step(self.encoder if self.cfg.ema_transformer_only else self)
+
+        self.num_updates = num_updates
+
+    def make_ema_teacher(self):
+        ema_config = EMAModuleConfig(
+            ema_decay=0.9999,
+            ema_fp32=True,
+        )
+
+        self.ema = EMAModule(
+            self.encoders,
+            ema_config,
+        )
+'''

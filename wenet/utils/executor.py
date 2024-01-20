@@ -117,6 +117,7 @@ class Executor:
                             log_str += '{} {:.6f} '.format(name, value.item())
                     log_str += 'lr {:.8f} rank {}'.format(lr, rank)
                     logging.debug(log_str)
+                # model.set_num_updates(self.step)
 
     def cv(self, model, data_loader, device, args):
         ''' Cross validation on
