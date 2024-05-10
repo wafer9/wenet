@@ -607,7 +607,7 @@ def batch(data, batch_type='static', batch_size=16, max_frames_in_batch=12000):
         logging.fatal('Unsupported batch type {}'.format(batch_type))
 
 
-def padding(data):
+def padding(data, pad=True):
     """ Padding the data into training data
 
         Args:
@@ -616,27 +616,54 @@ def padding(data):
         Returns:
             Iterable[Tuple(keys, feats, labels, feats lengths, label lengths)]
     """
+
+    
     for sample in data:
-        assert isinstance(sample, list)
-        feats_length = torch.tensor([x['feat'].size(0) for x in sample],
-                                    dtype=torch.int32)
-        order = torch.argsort(feats_length, descending=True)
-        feats_lengths = torch.tensor(
-            [sample[i]['feat'].size(0) for i in order], dtype=torch.int32)
-        sorted_feats = [sample[i]['feat'] for i in order]
-        sorted_keys = [sample[i]['key'] for i in order]
-        sorted_labels = [
-            torch.tensor(sample[i]['label'], dtype=torch.int64) for i in order
-        ]
-        label_lengths = torch.tensor([x.size(0) for x in sorted_labels],
-                                     dtype=torch.int32)
+        if pad:
+            assert isinstance(sample, list)
+            feats_length = torch.tensor([x['feat'].size(0) for x in sample],
+                                        dtype=torch.int32)
+            order = torch.argsort(feats_length, descending=True)
+            feats_lengths = torch.tensor(
+                [sample[i]['feat'].size(0) for i in order], dtype=torch.int32)
+            sorted_feats = [sample[i]['feat'] for i in order]
+            sorted_keys = [sample[i]['key'] for i in order]
+            sorted_labels = [
+                torch.tensor(sample[i]['label'], dtype=torch.int64) for i in order
+            ]
+            label_lengths = torch.tensor([x.size(0) for x in sorted_labels],
+                                        dtype=torch.int32)
 
-        padded_feats = pad_sequence(sorted_feats,
-                                    batch_first=True,
-                                    padding_value=0)
-        padding_labels = pad_sequence(sorted_labels,
-                                      batch_first=True,
-                                      padding_value=-1)
+            padded_feats = pad_sequence(sorted_feats,
+                                        batch_first=True,
+                                        padding_value=0)
+            padding_labels = pad_sequence(sorted_labels,
+                                        batch_first=True,
+                                        padding_value=-1)
 
-        yield (sorted_keys, padded_feats, padding_labels, feats_lengths,
-               label_lengths)
+            yield (sorted_keys, padded_feats, padding_labels, feats_lengths,
+                label_lengths)
+        else:
+            sizes = [sp['feat'].size(0) for sp in sample]
+            min_size = min(sizes)
+
+            keys = [sp['key'] for sp in sample]
+
+            feats = []
+            for i, (source, size) in enumerate(zip(sample, sizes)):
+                diff = size - min_size
+                if diff == 0:
+                    feats.append(source['feat'])
+                else:
+                    assert diff > 0
+                    start = random.randint(0, diff + 1)
+                    end = start + min_size
+                    feats.append(source['feat'][start:end])
+            feats = pad_sequence(feats,batch_first=True,padding_value=0)
+            feats_lengths = torch.tensor([min_size for x in sizes], dtype=torch.int32)
+
+            label_lengths = torch.tensor([len(sp['label']) for sp in sample], dtype=torch.int32)
+            labels = [torch.tensor(sp['label'], dtype=torch.int32) for sp in sample]
+            padding_labels = pad_sequence(labels, batch_first=True, padding_value=-1)
+            yield (keys, feats, padding_labels, feats_lengths, label_lengths)
+            

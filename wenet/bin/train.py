@@ -193,16 +193,17 @@ def main():
 
     # Init asr model from configs
     model = init_model(configs)
-    print(model)
-    num_params = sum(p.numel() for p in model.parameters())
-    print('the number of model params: {:,d}'.format(num_params))
+    if args.rank == 0:
+        print(model)
+        num_params = sum(p.numel() for p in model.parameters())
+        print('the number of model params: {:,d}'.format(num_params))
 
     # !!!IMPORTANT!!!
     # Try to export the model by script, if fails, we should refine
     # the code to satisfy the script export requirements
-    if args.rank == 0:
-        script_model = torch.jit.script(model)
-        script_model.save(os.path.join(args.model_dir, 'init.zip'))
+    # if args.rank == 0:
+    #     script_model = torch.jit.script(model)
+    #     script_model.save(os.path.join(args.model_dir, 'init.zip'))
     executor = Executor()
     # If specify checkpoint, load some info from checkpoint
     if args.checkpoint is not None:

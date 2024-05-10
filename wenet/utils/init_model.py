@@ -24,6 +24,7 @@ from wenet.transformer.decoder import BiTransformerDecoder, TransformerDecoder
 from wenet.transformer.encoder import ConformerEncoder, TransformerEncoder
 from wenet.squeezeformer.encoder import SqueezeformerEncoder
 from wenet.utils.cmvn import load_cmvn
+from wenet.ssl.bestrq.bestrq_model import BestRQModel
 
 
 def init_model(configs):
@@ -93,6 +94,8 @@ def init_model(configs):
                            joint=joint,
                            ctc=ctc,
                            **configs['model_conf'])
+    elif 'bestrq' in configs:
+        model = BestRQModel(encoder,  **configs['bestrq'])
     else:
         model = ASRModel(vocab_size=vocab_size,
                          encoder=encoder,
